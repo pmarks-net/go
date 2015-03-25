@@ -338,8 +338,10 @@ func numTCP() (ntcp, nopen, nclose int, err error) {
 	return ntcp, nopen, nclose, nil
 }
 
+// XXX need interesting dialSingle/dialMulti tests here.
+
 func TestDialMultiFDLeak(t *testing.T) {
-	t.Skip("flaky test - golang.org/issue/8764")
+	//t.Skip("flaky test - golang.org/issue/8764")
 
 	if !supportsIPv4 || !supportsIPv6 {
 		t.Skip("neither ipv4 nor ipv6 is supported")
@@ -376,27 +378,30 @@ func TestDialMultiFDLeak(t *testing.T) {
 
 	var wg sync.WaitGroup
 	portnum, _, _ := dtoi(dss.port, 0)
-	ras := addrList{
-		// Losers that will fail to connect, see RFC 6890.
-		&TCPAddr{IP: IPv4(198, 18, 0, 254), Port: portnum},
+	primaries := []Addr{
+		// This connection will time out; see RFC 6890.
 		&TCPAddr{IP: ParseIP("2001:2::254"), Port: portnum},
-
-		// Winner candidates of this race.
-		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: portnum},
+		// This connection will succeed.
 		&TCPAddr{IP: IPv6loopback, Port: portnum},
-
-		// Losers that will have established connections.
-		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: portnum},
+		// This won't be reached.
 		&TCPAddr{IP: IPv6loopback, Port: portnum},
 	}
-	const T1 = 10 * time.Millisecond
+	fallbacks := []Addr{
+		// This connection will time out; see RFC 6890.
+		&TCPAddr{IP: IPv4(198, 18, 0, 254), Port: portnum},
+		// This will be cancelled before beginning.
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: portnum},
+		// This will be cancelled before beginning.
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: portnum},
+	}
+	const T1 = 350 * time.Millisecond
 	const T2 = 2 * T1
 	const N = 10
 	for i := 0; i < N; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if c, err := dialMulti("tcp", "fast failover test", nil, ras, time.Now().Add(T1)); err == nil {
+			if c, err := dialParallel("tcp", "fast failover test", nil, primaries, fallbacks, time.Now().Add(T1)); err == nil {
 				c.Close()
 			}
 		}()

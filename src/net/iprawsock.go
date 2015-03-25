@@ -46,9 +46,9 @@ func ResolveIPAddr(net, addr string) (*IPAddr, error) {
 	default:
 		return nil, UnknownNetworkError(net)
 	}
-	a, err := resolveInternetAddr(afnet, addr, noDeadline)
+	addrs, err := resolveInternetAddrs(afnet, addr, noDeadline)
 	if err != nil {
 		return nil, err
 	}
-	return a.toAddr().(*IPAddr), nil
+	return addrs.getSingle().(*IPAddr), nil
 }

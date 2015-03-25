@@ -32,97 +32,139 @@ func init() {
 	supportsIPv6, supportsIPv4map = probeIPv6Stack()
 }
 
-// A netaddr represents a network endpoint address or a list of
-// network endpoint addresses.
-type netaddr interface {
-	// toAddr returns the address represented in Addr interface.
-	// It returns a nil interface when the address is nil.
-	toAddr() Addr
+
+type addrWithTags struct {
+	Addr
+	// single should be true on exactly one item within an addrList,
+	// to indicate that this address should be used by APIs that cannot
+	// handle more than one.
+	single   bool
+	// fallback may be true on some (but not all) addresses in an addrList,
+	// which moves them to the fallback thread when doing Happy Eyeballs.
+	fallback bool
 }
 
-// An addrList represents a list of network endpoint addresses.
-type addrList []netaddr
+type addrList []addrWithTags
 
-func (al addrList) toAddr() Addr {
-	switch len(al) {
-	case 0:
-		return nil
-	case 1:
-		return al[0].toAddr()
-	default:
-		// For now, we'll roughly pick first one without
-		// considering dealing with any preferences such as
-		// DNS TTL, transport path quality, network routing
-		// information.
-		return al[0].toAddr()
+// makeAddrList constructs an addrList list of exactly one element.
+func makeAddrList(addr Addr) addrList {
+	return addrList{
+		addrWithTags{
+			Addr:     addr,
+			single:   true,
+			fallback: false,
+		},
 	}
 }
+
+// getSingle picks a single address, for legacy code that can't handle lists.
+func (addrs addrList) getSingle() Addr {
+	var out Addr
+	count := 0
+	for _, addr := range addrs {
+		if addr.single {
+			out = addr.Addr
+			count++
+		}
+	}
+	if count != 1 {
+		panic("Malformed addrList: expected exactly 1 'single' tag")
+	}
+	return out
+}
+
+// getAll returns every address in order.
+func (addrs addrList) getAll() []Addr {
+	var out []Addr
+	for _, addr := range addrs {
+		out = append(out, addr.Addr)
+	}
+	return out
+}
+
+// getPrimaries returns only the addresses without a fallback tag.
+// When doing Happy Eyeballs, these belong in the primary thread.
+func (addrs addrList) getPrimaries() []Addr {
+	var out []Addr
+	for _, addr := range addrs {
+		if !addr.fallback {
+			out = append(out, addr.Addr)
+		}
+	}
+	return out
+}
+
+// getFallbacks returns only the addresses with a fallback tag.
+// When doing Happy Eyeballs, these belong in the delayed thread.
+func (addrs addrList) getFallbacks() []Addr {
+	var out []Addr
+	for _, addr := range addrs {
+		if addr.fallback {
+			out = append(out, addr.Addr)
+		}
+	}
+	return out
+}
+
 
 var errNoSuitableAddress = errors.New("no suitable address found")
 
-// firstFavoriteAddr returns an address or a list of addresses that
-// implement the netaddr interface. Known filters are nil, ipv4only
-// and ipv6only. It returns any address when filter is nil. The result
-// contains at least one address when error is nil.
-func firstFavoriteAddr(filter func(IPAddr) bool, ips []IPAddr, inetaddr func(IPAddr) netaddr) (netaddr, error) {
-	if filter != nil {
-		return firstSupportedAddr(filter, ips, inetaddr)
-	}
+// filterAndTagAddrs applies a filter to a list of IP addresses, and
+// tags them for use by a Happy Eyeballs algorithm.  Known filters are
+// nil, ipv4only, and ipv6only.  It returns all addresses when the
+// filter is nil.  When error is nil, the resulting getSingle(),
+// getPrimaries(), and getAll() will return at least one address.
+func filterAndTagAddrs(filter func(IPAddr) bool, ips []IPAddr, inetaddr func(IPAddr) Addr) (addrList, error) {
 	var (
-		ipv4, ipv6, swap bool
-		list             addrList
+		addrs     addrList
+		v4Addrs   []int
+		v6Addrs   []int
+		fallbacks *[]int
 	)
 	for _, ip := range ips {
-		// We'll take any IP address, but since the dialing
-		// code does not yet try multiple addresses
-		// effectively, prefer to use an IPv4 address if
-		// possible. This is especially relevant if localhost
-		// resolves to [ipv6-localhost, ipv4-localhost]. Too
-		// much code assumes localhost == ipv4-localhost.
-		if ipv4only(ip) && !ipv4 {
-			list = append(list, inetaddr(ip))
-			ipv4 = true
-			if ipv6 {
-				swap = true
-			}
-		} else if ipv6only(ip) && !ipv6 {
-			list = append(list, inetaddr(ip))
-			ipv6 = true
+		if filter != nil && !filter(ip) {
+			continue
 		}
-		if ipv4 && ipv6 {
-			if swap {
-				list[0], list[1] = list[1], list[0]
+		if ipv4only(ip) {
+			if fallbacks == nil {
+				fallbacks = &v6Addrs
 			}
-			break
+			v4Addrs = append(v4Addrs, len(addrs))
+			addrs = append(addrs, addrWithTags{Addr: inetaddr(ip)})
+		} else if ipv6only(ip) {
+			if fallbacks == nil {
+				fallbacks = &v4Addrs
+			}
+			v6Addrs = append(v6Addrs, len(addrs))
+			addrs = append(addrs, addrWithTags{Addr: inetaddr(ip)})
 		}
 	}
-	switch len(list) {
-	case 0:
+	// Tag the one address that getSingle() should return,
+	// while preferring IPv4 for legacy compatibility.
+	if len(v4Addrs) > 0 {
+		addrs[v4Addrs[0]].single = true
+	} else if len(v6Addrs) > 0 {
+		addrs[v6Addrs[0]].single = true
+	} else {
 		return nil, errNoSuitableAddress
-	case 1:
-		return list[0], nil
-	default:
-		return list, nil
 	}
+	// Tag the fallback addresses.
+	for _, i := range *fallbacks {
+		addrs[i].fallback = true
+	}
+	return addrs, nil
 }
 
-func firstSupportedAddr(filter func(IPAddr) bool, ips []IPAddr, inetaddr func(IPAddr) netaddr) (netaddr, error) {
-	for _, ip := range ips {
-		if filter(ip) {
-			return inetaddr(ip), nil
-		}
-	}
-	return nil, errNoSuitableAddress
-}
-
-// ipv4only reports whether the kernel supports IPv4 addressing mode
-// and addr is an IPv4 address.
+// ipv4only returns IPv4 addresses that we can use with the kernel's
+// IPv4 addressing modes. If ip is an IPv4 address, ipv4only returns true.
+// Otherwise it returns false.
 func ipv4only(addr IPAddr) bool {
 	return supportsIPv4 && addr.IP.To4() != nil
 }
 
-// ipv6only reports whether the kernel supports IPv6 addressing mode
-// and addr is an IPv6 address except IPv4-mapped IPv6 address.
+// ipv6only returns IPv6 addresses that we can use with the kernel's
+// IPv6 addressing modes.  It returns true for regular IPv6 addresses,
+// and false for anything else (including IPv4-mapped IPv6.)
 func ipv6only(addr IPAddr) bool {
 	return supportsIPv6 && len(addr.IP) == IPv6len && addr.IP.To4() == nil
 }
@@ -226,7 +268,7 @@ func JoinHostPort(host, port string) string {
 // address family addresses when addr is a DNS name and the name has
 // multiple address family records. The result contains at least one
 // address when error is nil.
-func resolveInternetAddr(net, addr string, deadline time.Time) (netaddr, error) {
+func resolveInternetAddrs(net, addr string, deadline time.Time) (addrList, error) {
 	var (
 		err        error
 		host, port string
@@ -249,7 +291,7 @@ func resolveInternetAddr(net, addr string, deadline time.Time) (netaddr, error) 
 	default:
 		return nil, UnknownNetworkError(net)
 	}
-	inetaddr := func(ip IPAddr) netaddr {
+	inetaddr := func(ip IPAddr) Addr {
 		switch net {
 		case "tcp", "tcp4", "tcp6":
 			return &TCPAddr{IP: ip.IP, Port: portnum, Zone: ip.Zone}
@@ -262,16 +304,16 @@ func resolveInternetAddr(net, addr string, deadline time.Time) (netaddr, error) 
 		}
 	}
 	if host == "" {
-		return inetaddr(IPAddr{}), nil
+		return makeAddrList(inetaddr(IPAddr{})), nil
 	}
 	// Try as a literal IP address.
 	var ip IP
 	if ip = parseIPv4(host); ip != nil {
-		return inetaddr(IPAddr{IP: ip}), nil
+		return makeAddrList(inetaddr(IPAddr{IP: ip})), nil
 	}
 	var zone string
 	if ip, zone = parseIPv6(host, true); ip != nil {
-		return inetaddr(IPAddr{IP: ip, Zone: zone}), nil
+		return makeAddrList(inetaddr(IPAddr{IP: ip, Zone: zone})), nil
 	}
 	// Try as a DNS name.
 	ips, err := lookupIPDeadline(host, deadline)
@@ -285,7 +327,7 @@ func resolveInternetAddr(net, addr string, deadline time.Time) (netaddr, error) 
 	if net != "" && net[len(net)-1] == '6' {
 		filter = ipv6only
 	}
-	return firstFavoriteAddr(filter, ips, inetaddr)
+	return filterAndTagAddrs(filter, ips, inetaddr)
 }
 
 func zoneToString(zone int) string {

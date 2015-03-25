@@ -9,13 +9,15 @@ import (
 	"testing"
 )
 
-var testInetaddr = func(ip IPAddr) netaddr { return &TCPAddr{IP: ip.IP, Port: 5682, Zone: ip.Zone} }
+var testInetaddr = func(ip IPAddr) Addr { return &TCPAddr{IP: ip.IP, Port: 5682, Zone: ip.Zone} }
 
-var firstFavoriteAddrTests = []struct {
-	filter   func(IPAddr) bool
-	ips      []IPAddr
-	inetaddr func(IPAddr) netaddr
-	addr     netaddr
+var filterAndTagAddrsTests = []struct {
+	filter     func(IPAddr) bool
+	ips        []IPAddr
+	inetaddr   func(IPAddr) Addr
+	singleAddr Addr
+	primaries  []Addr
+	fallbacks  []Addr
 	err      error
 }{
 	{
@@ -25,10 +27,9 @@ var firstFavoriteAddrTests = []struct {
 			{IP: IPv6loopback},
 		},
 		testInetaddr,
-		addrList{
-			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
-			&TCPAddr{IP: IPv6loopback, Port: 5682},
-		},
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682}},
+		[]Addr{&TCPAddr{IP: IPv6loopback, Port: 5682}},
 		nil,
 	},
 	{
@@ -38,10 +39,9 @@ var firstFavoriteAddrTests = []struct {
 			{IP: IPv4(127, 0, 0, 1)},
 		},
 		testInetaddr,
-		addrList{
-			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
-			&TCPAddr{IP: IPv6loopback, Port: 5682},
-		},
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv6loopback, Port: 5682}},
+		[]Addr{&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682}},
 		nil,
 	},
 	{
@@ -52,6 +52,11 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{
+			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+			&TCPAddr{IP: IPv4(192, 168, 0, 1), Port: 5682},
+		},
+		nil,
 		nil,
 	},
 	{
@@ -62,6 +67,11 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv6loopback, Port: 5682},
+		[]Addr{
+			&TCPAddr{IP: IPv6loopback, Port: 5682},
+			&TCPAddr{IP: ParseIP("fe80::1"), Port: 5682, Zone: "eth0"},
+		},
+		nil,
 		nil,
 	},
 	{
@@ -73,9 +83,14 @@ var firstFavoriteAddrTests = []struct {
 			{IP: ParseIP("fe80::1"), Zone: "eth0"},
 		},
 		testInetaddr,
-		addrList{
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{
 			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+			&TCPAddr{IP: IPv4(192, 168, 0, 1), Port: 5682},
+		},
+		[]Addr{
 			&TCPAddr{IP: IPv6loopback, Port: 5682},
+			&TCPAddr{IP: ParseIP("fe80::1"), Port: 5682, Zone: "eth0"},
 		},
 		nil,
 	},
@@ -88,9 +103,14 @@ var firstFavoriteAddrTests = []struct {
 			{IP: IPv4(192, 168, 0, 1)},
 		},
 		testInetaddr,
-		addrList{
-			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{
 			&TCPAddr{IP: IPv6loopback, Port: 5682},
+			&TCPAddr{IP: ParseIP("fe80::1"), Port: 5682, Zone: "eth0"},
+		},
+		[]Addr{
+			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+			&TCPAddr{IP: IPv4(192, 168, 0, 1), Port: 5682},
 		},
 		nil,
 	},
@@ -103,9 +123,14 @@ var firstFavoriteAddrTests = []struct {
 			{IP: ParseIP("fe80::1"), Zone: "eth0"},
 		},
 		testInetaddr,
-		addrList{
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{
 			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+			&TCPAddr{IP: IPv4(192, 168, 0, 1), Port: 5682},
+		},
+		[]Addr{
 			&TCPAddr{IP: IPv6loopback, Port: 5682},
+			&TCPAddr{IP: ParseIP("fe80::1"), Port: 5682, Zone: "eth0"},
 		},
 		nil,
 	},
@@ -118,9 +143,14 @@ var firstFavoriteAddrTests = []struct {
 			{IP: IPv4(192, 168, 0, 1)},
 		},
 		testInetaddr,
-		addrList{
-			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{
 			&TCPAddr{IP: IPv6loopback, Port: 5682},
+			&TCPAddr{IP: ParseIP("fe80::1"), Port: 5682, Zone: "eth0"},
+		},
+		[]Addr{
+			&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+			&TCPAddr{IP: IPv4(192, 168, 0, 1), Port: 5682},
 		},
 		nil,
 	},
@@ -133,6 +163,8 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682}},
+		nil,
 		nil,
 	},
 	{
@@ -143,6 +175,8 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 5682}},
+		nil,
 		nil,
 	},
 
@@ -154,6 +188,8 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv6loopback, Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv6loopback, Port: 5682}},
+		nil,
 		nil,
 	},
 	{
@@ -164,30 +200,52 @@ var firstFavoriteAddrTests = []struct {
 		},
 		testInetaddr,
 		&TCPAddr{IP: IPv6loopback, Port: 5682},
+		[]Addr{&TCPAddr{IP: IPv6loopback, Port: 5682}},
+		nil,
 		nil,
 	},
 
-	{nil, nil, testInetaddr, nil, errNoSuitableAddress},
+	{nil, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
 
-	{ipv4only, nil, testInetaddr, nil, errNoSuitableAddress},
-	{ipv4only, []IPAddr{{IP: IPv6loopback}}, testInetaddr, nil, errNoSuitableAddress},
+	{ipv4only, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
+	{ipv4only, []IPAddr{IPAddr{IP: IPv6loopback}}, testInetaddr, nil, nil, nil, errNoSuitableAddress},
 
-	{ipv6only, nil, testInetaddr, nil, errNoSuitableAddress},
-	{ipv6only, []IPAddr{{IP: IPv4(127, 0, 0, 1)}}, testInetaddr, nil, errNoSuitableAddress},
+	{ipv6only, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
+	{ipv6only, []IPAddr{IPAddr{IP: IPv4(127, 0, 0, 1)}}, testInetaddr, nil, nil, nil, errNoSuitableAddress},
 }
 
-func TestFirstFavoriteAddr(t *testing.T) {
+func TestFilterAndTagAddrs(t *testing.T) {
 	if !supportsIPv4 || !supportsIPv6 {
 		t.Skip("ipv4 or ipv6 is not supported")
 	}
 
-	for i, tt := range firstFavoriteAddrTests {
-		addr, err := firstFavoriteAddr(tt.filter, tt.ips, tt.inetaddr)
+	for i, tt := range filterAndTagAddrsTests {
+		addrs, err := filterAndTagAddrs(tt.filter, tt.ips, tt.inetaddr)
 		if err != tt.err {
-			t.Errorf("#%v: got %v; expected %v", i, err, tt.err)
+			t.Errorf("#%v: got err %v; expected %v", i, err, tt.err)
 		}
-		if !reflect.DeepEqual(addr, tt.addr) {
-			t.Errorf("#%v: got %v; expected %v", i, addr, tt.addr)
+		if tt.err != nil {
+			if len(addrs) != 0 {
+				t.Errorf("#%v: got %v addrs, expected 0", len(addrs))
+			}
+			continue
+		}
+		singleAddr := addrs.getSingle()
+		if !reflect.DeepEqual(singleAddr, tt.singleAddr) {
+			t.Errorf("#%v: got singleAddr %v; expected %v", i, singleAddr, tt.singleAddr)
+		}
+		primaries := addrs.getPrimaries()
+		if !reflect.DeepEqual(primaries, tt.primaries) {
+			t.Errorf("#%v: got primaries %v; expected %v", i, primaries, tt.primaries)
+		}
+		fallbacks := addrs.getFallbacks()
+		if !reflect.DeepEqual(fallbacks, tt.fallbacks) {
+			t.Errorf("#%v: got fallbacks %v; expected %v", i, fallbacks, tt.fallbacks)
+		}
+		allCount := len(addrs.getAll())
+		expectedAllCount := len(primaries) + len(fallbacks)
+		if allCount != expectedAllCount {
+			t.Errorf("#%v: got %v addrs from getAll(); expected %v", i, allCount, expectedAllCount)
 		}
 	}
 }

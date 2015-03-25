@@ -6,6 +6,7 @@ package net
 
 import (
 	"errors"
+	"log" // XXX temporary.
 	"time"
 )
 
@@ -95,7 +96,7 @@ func parseNetwork(net string) (afnet string, proto int, err error) {
 	return "", 0, UnknownNetworkError(net)
 }
 
-func resolveAddr(op, net, addr string, deadline time.Time) (netaddr, error) {
+func resolveAddrs(op, net, addr string, deadline time.Time) (addrList, error) {
 	afnet, _, err := parseNetwork(net)
 	if err != nil {
 		return nil, err
@@ -105,9 +106,13 @@ func resolveAddr(op, net, addr string, deadline time.Time) (netaddr, error) {
 	}
 	switch afnet {
 	case "unix", "unixgram", "unixpacket":
-		return ResolveUnixAddr(afnet, addr)
+		unixAddr, err := ResolveUnixAddr(afnet, addr)
+		if err != nil {
+			return nil, err
+		}
+		return makeAddrList(unixAddr), nil
 	}
-	return resolveInternetAddr(afnet, addr, deadline)
+	return resolveInternetAddrs(afnet, addr, deadline)
 }
 
 // Dial connects to the address on the named network.
@@ -155,21 +160,21 @@ func DialTimeout(network, address string, timeout time.Duration) (Conn, error) {
 // See func Dial for a description of the network and address
 // parameters.
 func (d *Dialer) Dial(network, address string) (Conn, error) {
-	ra, err := resolveAddr("dial", network, address, d.deadline())
+	ras, err := resolveAddrs("dial", network, address, d.deadline())
+	log.Printf("Dial: %v\n", ras)
 	if err != nil {
 		return nil, &OpError{Op: "dial", Net: network, Addr: nil, Err: err}
 	}
-	var dialer func(deadline time.Time) (Conn, error)
-	if ras, ok := ra.(addrList); ok && d.DualStack && network == "tcp" {
-		dialer = func(deadline time.Time) (Conn, error) {
-			return dialMulti(network, address, d.LocalAddr, ras, deadline)
-		}
+
+	var primaries, fallbacks []Addr
+	if d.DualStack && network == "tcp" {
+		primaries = ras.getPrimaries()
+		fallbacks = ras.getFallbacks()
 	} else {
-		dialer = func(deadline time.Time) (Conn, error) {
-			return dialSingle(network, address, d.LocalAddr, ra.toAddr(), deadline)
-		}
+		primaries = ras.getAll()
 	}
-	c, err := dial(network, ra.toAddr(), dialer, d.deadline())
+
+	c, err := dialParallel(network, address, d.LocalAddr, primaries, fallbacks, d.deadline())
 	if d.KeepAlive > 0 && err == nil {
 		if tc, ok := c.(*TCPConn); ok {
 			tc.SetKeepAlive(true)
@@ -182,52 +187,120 @@ func (d *Dialer) Dial(network, address string) (Conn, error) {
 
 var testHookSetKeepAlive = func() {} // changed by dial_test.go
 
-// dialMulti attempts to establish connections to each destination of
-// the list of addresses. It will return the first established
-// connection and close the other connections. Otherwise it returns
-// error on the last attempt.
-func dialMulti(net, addr string, la Addr, ras addrList, deadline time.Time) (Conn, error) {
-	type racer struct {
-		Conn
-		error
+type connOrError struct {
+	Conn
+	error
+}
+
+// dialParallel implements Happy Eyeballs by racing two address lists.
+// It returns the first established connection and closes the others.
+// Otherwise it returns an error from the last attempt.  The fallbacks
+// list may be empty to disable fast fallback behavior.
+func dialParallel(net, addr string, la Addr, primaries, fallbacks []Addr, deadline time.Time) (Conn, error) {
+	results := make(chan connOrError, 0)
+	cancel := make(chan bool, 0)
+	defer close(cancel)
+
+	nracers := 1
+	go dialSerial(net, addr, la, primaries, deadline, false, cancel, results)
+
+	if len(fallbacks) > 0 {
+		// Activate fast fallback.
+		nracers++
+		go dialSerial(net, addr, la, fallbacks, deadline, true, cancel, results)
 	}
-	// Sig controls the flow of dial results on lane. It passes a
-	// token to the next racer and also indicates the end of flow
-	// by using closed channel.
-	sig := make(chan bool, 1)
-	lane := make(chan racer, 1)
-	for _, ra := range ras {
-		go func(ra Addr) {
-			c, err := dialSingle(net, addr, la, ra, deadline)
-			if _, ok := <-sig; ok {
-				lane <- racer{c, err}
-			} else if err == nil {
-				// We have to return the resources
-				// that belong to the other
-				// connections here for avoiding
-				// unnecessary resource starvation.
-				c.Close()
-			}
-		}(ra.toAddr())
-	}
-	defer close(sig)
-	lastErr := errTimeout
-	nracers := len(ras)
+
+	var lastErr error
 	for nracers > 0 {
-		sig <- true
-		racer := <-lane
-		if racer.error == nil {
-			return racer.Conn, nil
+		res := <-results
+		if res.error == nil {
+			return res.Conn, nil
 		}
-		lastErr = racer.error
+		lastErr = res.error
 		nracers--
 	}
 	return nil, lastErr
 }
 
+// computePartialDeadline returns the deadline to use for a single address,
+// when multiple addresses are pending.
+func computePartialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, error) {
+	if deadline.IsZero() {
+		return deadline, nil
+	}
+	timeRemaining := deadline.Sub(now)
+	if timeRemaining <= 0 {
+		return time.Time{}, errTimeout
+	}
+	// Tentatively allocate equal time to each remaining address.
+	timeout := timeRemaining / time.Duration(addrsRemaining)
+	// If the time per address is too short, steal from the end of the list.
+	const saneMinimum = 2 * time.Second
+	if timeout < saneMinimum {
+		if timeRemaining < saneMinimum {
+			timeout = timeRemaining
+		} else {
+			timeout = saneMinimum
+		}
+	}
+	return now.Add(timeout), nil
+}
+
+// dialSerial connects to a list of addresses in sequence, and returns the first
+// successful connection to the results channel.  If the cancel channel is
+// closed (because the other racer returned a value first), this does nothing
+// at its earliest convenience.
+func dialSerial(net, addr string, la Addr, ras []Addr, deadline time.Time, delay bool, cancel <-chan bool, results chan<- connOrError) {
+	if delay {
+		// Delay the Happy Eyeballs fallback connection.
+		time.Sleep(time.Millisecond * 300)
+	}
+	lastErr := errMissingAddress
+	for i, ra := range ras {
+		select {
+		case <-cancel:
+			log.Printf("cancel 1")
+			return
+		default:
+		}
+
+		partialDeadline, err := computePartialDeadline(time.Now(), deadline, len(ras) - i)
+		if err != nil {
+			// Ran out of time.
+			lastErr = err
+			break
+		}
+
+		dialer := func(d time.Time) (Conn, error) {
+			return dialSingle(net, addr, la, ra, d)
+		}
+		c, err := dial(net, ra, dialer, partialDeadline)
+		log.Printf("XXX dial() result: %v %v %v\n", ra, c, err)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		select {
+		case results <- connOrError{c, nil}:
+		case <-cancel:
+			c.Close()
+			log.Printf("cancel 2")
+		}
+		return
+	}
+	select {
+	case results <- connOrError{nil, lastErr}:
+	case <-cancel:
+		log.Printf("cancel 3")
+	}
+}
+
 // dialSingle attempts to establish and returns a single connection to
-// the destination address.
+// the destination address.  This must be called through the OS-specific
+// dial() function, because some OSes don't implement the deadline feature.
 func dialSingle(net, addr string, la, ra Addr, deadline time.Time) (c Conn, err error) {
+	log.Printf("XXX dialSingle called with %v\n", ra)
 	if la != nil && la.Network() != ra.Network() {
 		return nil, &OpError{Op: "dial", Net: net, Addr: ra, Err: errors.New("mismatched local address type " + la.Network())}
 	}
@@ -258,12 +331,12 @@ func dialSingle(net, addr string, la, ra Addr, deadline time.Time) (c Conn, err 
 // "tcp6", "unix" or "unixpacket".
 // See Dial for the syntax of laddr.
 func Listen(net, laddr string) (Listener, error) {
-	la, err := resolveAddr("listen", net, laddr, noDeadline)
+	la, err := resolveAddrs("listen", net, laddr, noDeadline)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: net, Addr: nil, Err: err}
 	}
 	var l Listener
-	switch la := la.toAddr().(type) {
+	switch la := la.getSingle().(type) {
 	case *TCPAddr:
 		l, err = ListenTCP(net, la)
 	case *UnixAddr:
@@ -282,12 +355,12 @@ func Listen(net, laddr string) (Listener, error) {
 // "udp6", "ip", "ip4", "ip6" or "unixgram".
 // See Dial for the syntax of laddr.
 func ListenPacket(net, laddr string) (PacketConn, error) {
-	la, err := resolveAddr("listen", net, laddr, noDeadline)
+	la, err := resolveAddrs("listen", net, laddr, noDeadline)
 	if err != nil {
 		return nil, &OpError{Op: "listen", Net: net, Addr: nil, Err: err}
 	}
 	var l PacketConn
-	switch la := la.toAddr().(type) {
+	switch la := la.getSingle().(type) {
 	case *UDPAddr:
 		l, err = ListenUDP(net, la)
 	case *IPAddr:
